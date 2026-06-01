@@ -27,8 +27,9 @@ ARG GID=0
 FROM --platform=$BUILDPLATFORM node:22-alpine3.20 AS build
 ARG BUILD_HASH
 
-# Set Node.js options (heap limit Allocation failed - JavaScript heap out of memory)
-# ENV NODE_OPTIONS="--max-old-space-size=4096"
+# CoreThesis: raise Node heap limit during Vite build. 4096 is upstream's suggestion;
+# on a 4GB host we cap lower so the build doesn't fight the rest of the system.
+ENV NODE_OPTIONS="--max-old-space-size=3072"
 
 WORKDIR /app
 

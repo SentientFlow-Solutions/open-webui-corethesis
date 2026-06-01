@@ -172,6 +172,16 @@ RUN if [ "$USE_OLLAMA" = "true" ]; then \
     rm -rf /var/lib/apt/lists/*; \
     fi
 
+# CoreThesis: install Node.js 22 + the openclaw CLI so the backend can shell
+# out to `openclaw agent --json`. The CLI runs in "remote gateway" mode and
+# connects to the host's openclaw gateway via OPENCLAW_GATEWAY_URL/TOKEN
+# (configured at container startup by docker-entrypoint.sh).
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    npm install -g openclaw@2026.5.22 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 # copy embedding weight from build
 # RUN mkdir -p /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2
 # COPY --from=build /app/onnx /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx
@@ -183,6 +193,10 @@ COPY --chown=$UID:$GID --from=build /app/package.json /app/package.json
 
 # copy backend files
 COPY --chown=$UID:$GID ./backend .
+
+# CoreThesis: container entrypoint that configures openclaw for the host gateway
+COPY --chown=$UID:$GID docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 8080
 
@@ -205,4 +219,4 @@ ARG BUILD_HASH
 ENV WEBUI_BUILD_VERSION=${BUILD_HASH}
 ENV DOCKER=true
 
-CMD [ "bash", "start.sh"]
+CMD [ "/usr/local/bin/docker-entrypoint.sh" ]

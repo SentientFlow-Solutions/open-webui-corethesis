@@ -10,6 +10,7 @@
 	let agents = [];
 	let health = null;
 	let errorMessage = '';
+	let showPicker = false;
 
 	const load = async () => {
 		loading = true;
@@ -28,6 +29,23 @@
 			]);
 			health = h;
 			agents = a ?? [];
+
+			// Skip the picker for the common case: go straight to the default agent
+			// (or the only agent, if there's just one). The picker still renders
+			// when the user explicitly opens /openclaw?pick=1 or when no default
+			// is configured.
+			const params = new URLSearchParams(window.location.search);
+			const forcePick = params.get('pick') === '1';
+			if (!forcePick && agents.length > 0) {
+				const target =
+					agents.find((a) => a.is_default) ??
+					(agents.length === 1 ? agents[0] : null);
+				if (target) {
+					goto(`/openclaw/${encodeURIComponent(target.id)}`, { replaceState: true });
+					return;
+				}
+			}
+			showPicker = true;
 		} finally {
 			loading = false;
 		}

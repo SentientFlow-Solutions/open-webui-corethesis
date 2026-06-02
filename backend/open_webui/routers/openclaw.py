@@ -89,11 +89,35 @@ async def _run_openclaw(argv: list[str], timeout: int) -> tuple[int, str, str]:
     return proc.returncode or 0, stdout_b.decode("utf-8", errors="replace"), stderr_b.decode("utf-8", errors="replace")
 
 
+def _clean_reply(text: str) -> str:
+    """Strip the NO_REPLY sentinel the agent appends when it has nothing to add.
+
+    Example: "Hello! 📊\n\nNO_REPLY" -> "Hello! 📊"
+    """
+    cleaned = text.rstrip()
+    # Token can appear alone on the last line or at end of a line, in either case
+    # remove it and any trailing whitespace it left behind.
+    if cleaned.endswith("NO_REPLY"):
+        cleaned = cleaned[: -len("NO_REPLY")].rstrip()
+    return cleaned
+
+
 def _extract_reply(stdout: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Pull the assistant reply text from `openclaw agent --json` stdout.
 
-    The envelope shape is mildly version-dependent; we probe likely paths and
-    fall back to the raw stdout if none match. Returns (reply, raw_envelope).
+    The current envelope (openclaw 2026.5.x) is:
+        {
+          "runId": "...",
+          "status": "ok",
+          "summary": "completed",
+          "result": {
+            "payloads": [{"text": "...", "mediaUrl": null}, ...],
+            "meta": {...}
+          }
+        }
+
+    We extract by concatenating payloads[*].text. Older / alternate shapes are
+    probed as fallbacks. Returns (reply, raw_envelope).
     """
     stdout = stdout.strip()
     if not stdout:
@@ -106,27 +130,45 @@ def _extract_reply(stdout: str) -> tuple[Optional[str], Optional[dict[str, Any]]
     if not isinstance(envelope, dict):
         return stdout, None
 
+    # Primary path: result.payloads[*].text
+    result = envelope.get("result")
+    if isinstance(result, dict):
+        payloads = result.get("payloads")
+        if isinstance(payloads, list) and payloads:
+            chunks: list[str] = []
+            for p in payloads:
+                if isinstance(p, dict):
+                    t = p.get("text")
+                    if isinstance(t, str) and t.strip():
+                        chunks.append(t)
+            if chunks:
+                return _clean_reply("\n\n".join(chunks)), envelope
+
+    # Fallback paths for older/alternate envelopes.
+    result_dict = result if isinstance(result, dict) else {}
+    data_dict = envelope.get("data") if isinstance(envelope.get("data"), dict) else {}
+    response_dict = envelope.get("response") if isinstance(envelope.get("response"), dict) else {}
     candidates: list[Any] = [
         envelope.get("reply"),
         envelope.get("message"),
         envelope.get("output"),
         envelope.get("text"),
         envelope.get("content"),
-        (envelope.get("result") or {}).get("message") if isinstance(envelope.get("result"), dict) else None,
-        (envelope.get("result") or {}).get("reply") if isinstance(envelope.get("result"), dict) else None,
-        (envelope.get("result") or {}).get("text") if isinstance(envelope.get("result"), dict) else None,
-        (envelope.get("data") or {}).get("message") if isinstance(envelope.get("data"), dict) else None,
-        (envelope.get("data") or {}).get("reply") if isinstance(envelope.get("data"), dict) else None,
-        (envelope.get("response") or {}).get("text") if isinstance(envelope.get("response"), dict) else None,
+        result_dict.get("message"),
+        result_dict.get("reply"),
+        result_dict.get("text"),
+        data_dict.get("message"),
+        data_dict.get("reply"),
+        response_dict.get("text"),
     ]
     for cand in candidates:
         if isinstance(cand, str) and cand.strip():
-            return cand, envelope
+            return _clean_reply(cand), envelope
         if isinstance(cand, dict):
             for k in ("text", "content", "message"):
                 v = cand.get(k)
                 if isinstance(v, str) and v.strip():
-                    return v, envelope
+                    return _clean_reply(v), envelope
 
     return None, envelope
 

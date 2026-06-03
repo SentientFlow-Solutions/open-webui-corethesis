@@ -1059,6 +1059,22 @@ OTEL_LOGS_OTLP_SPAN_EXPORTER = os.environ.get(
 ).lower()  # grpc or http
 
 ####################################
+# LANGFUSE (observability + usage views)
+####################################
+
+LANGFUSE_PUBLIC_KEY = os.environ.get('LANGFUSE_PUBLIC_KEY', '')
+LANGFUSE_SECRET_KEY = os.environ.get('LANGFUSE_SECRET_KEY', '')
+LANGFUSE_BASE_URL = os.environ.get('LANGFUSE_BASE_URL', '').rstrip('/')
+
+# Only enable when all three are present; an explicit ENABLE_LANGFUSE=false can
+# still disable it, but it can never be force-enabled without keys.
+_LANGFUSE_CONFIGURED = bool(LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY and LANGFUSE_BASE_URL)
+ENABLE_LANGFUSE = (
+    os.environ.get('ENABLE_LANGFUSE', str(_LANGFUSE_CONFIGURED)).lower() == 'true'
+    and _LANGFUSE_CONFIGURED
+)
+
+####################################
 # TOOLS/FUNCTIONS PIP OPTIONS
 ####################################
 

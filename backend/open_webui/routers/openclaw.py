@@ -580,14 +580,20 @@ async def openai_compat_chat_completions(
         agent_task = asyncio.create_task(_run_openclaw(argv, timeout=timeout + 30))
 
         # Heartbeat until the agent finishes.
+        # NOTE: we use empty `data: {...}` chunks (standard OpenAI format)
+        # rather than SSE comment lines (`: keepalive\n\n`). Comment lines are
+        # technically valid SSE and would be ignored by a spec-compliant
+        # EventSource client, but Open WebUI's chat frontend parses SSE
+        # manually and treats comment lines as no-traffic — its "connection
+        # appears dead" handler then triggers without firing a render, and
+        # the user has to reload the page to see the eventual reply. Empty
+        # delta chunks pass through every layer (router, proxy, frontend
+        # parser) cleanly and keep the connection visibly alive.
         while not agent_task.done():
             try:
                 await asyncio.wait_for(asyncio.shield(agent_task), timeout=5.0)
             except asyncio.TimeoutError:
-                # SSE comment line: starts with ':' — keeps the connection
-                # alive without contributing visible content. Standard pattern
-                # for long-running OpenAI-compatible endpoints.
-                yield ": keepalive\n\n"
+                yield _sse_chunk(chunk_id, created, requested_model, "")
             except Exception:
                 # Real failure — break out and let the post-loop block handle.
                 break

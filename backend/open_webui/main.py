@@ -1765,6 +1765,7 @@ async def chat_completion(
         user_message = form_data.pop('user_message', None) or form_data.pop('parent_message', None)
         metadata = {
             'user_id': user.id,
+            'start_time': time.time(),
             'chat_id': form_data.pop('chat_id', None),
             'user_message': user_message,
             'user_message_id': user_message.get('id') if user_message else None,

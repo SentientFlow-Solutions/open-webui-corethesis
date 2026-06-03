@@ -115,6 +115,7 @@ from open_webui.utils.filter import (
 from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.payload import apply_system_prompt_to_body
 from open_webui.utils.response import normalize_usage
+from open_webui.utils.telemetry.langfuse_tracing import trace_chat_turn
 from open_webui.utils.mcp.client import MCPClient
 
 
@@ -3531,6 +3532,7 @@ async def non_streaming_chat_response_handler(response, ctx):
                         'output': response_output,
                         **({'usage': usage} if usage else {}),
                     }
+                    await trace_chat_turn(ctx)
                     await outlet_filter_handler(ctx)
 
             response = build_response_object(response, merge_events_into_response(response_data, events))
@@ -5106,6 +5108,7 @@ async def streaming_chat_response_handler(response, ctx):
                     'output': output,
                     **({'usage': usage} if usage else {}),
                 }
+                await trace_chat_turn(ctx)
                 await outlet_filter_handler(ctx)
             except asyncio.CancelledError:
                 log.warning('Task was cancelled!')

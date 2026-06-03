@@ -414,8 +414,17 @@ def _messages_to_message(messages: list[dict[str, Any]]) -> str:
     return str(last or "")
 
 
-def _sse_chunk(chunk_id: str, created: int, model: str, content: str, finish: Optional[str] = None) -> str:
+def _sse_chunk(
+    chunk_id: str,
+    created: int,
+    model: str,
+    content: str,
+    finish: Optional[str] = None,
+    role: Optional[str] = None,
+) -> str:
     delta: dict[str, Any] = {}
+    if role:
+        delta["role"] = role
     if content:
         delta["content"] = content
     payload = {
@@ -572,23 +581,24 @@ async def openai_compat_chat_completions(
     # connection died (it'd take ~30s before Open WebUI gives up).
 
     async def stream_body():
-        # Initial role-only chunk so the client renders the empty assistant
-        # bubble + typing indicator immediately.
-        yield _sse_chunk(chunk_id, created, requested_model, "")
+        # First chunk: role-bearing delta. This mirrors what OpenAI's real
+        # streaming API emits as its very first event. Open WebUI's
+        # streaming_chat_response_handler in middleware.py only "opens" an
+        # assistant message item (and starts emitting chat:completion events
+        # to the frontend over Socket.IO) once it sees a chunk that establishes
+        # the assistant role. An empty `delta: {}` is skipped, leaving the
+        # client with no rendered bubble — so the eventual reply only shows up
+        # after a page reload pulls it from chat history. Sending {"role":
+        # "assistant"} here is the canonical OpenAI behavior and unblocks
+        # rendering.
+        yield _sse_chunk(chunk_id, created, requested_model, "", role="assistant")
 
         # Kick off the agent.
         agent_task = asyncio.create_task(_run_openclaw(argv, timeout=timeout + 30))
 
         # Heartbeat until the agent finishes.
-        # NOTE: we use empty `data: {...}` chunks (standard OpenAI format)
-        # rather than SSE comment lines (`: keepalive\n\n`). Comment lines are
-        # technically valid SSE and would be ignored by a spec-compliant
-        # EventSource client, but Open WebUI's chat frontend parses SSE
-        # manually and treats comment lines as no-traffic — its "connection
-        # appears dead" handler then triggers without firing a render, and
-        # the user has to reload the page to see the eventual reply. Empty
-        # delta chunks pass through every layer (router, proxy, frontend
-        # parser) cleanly and keep the connection visibly alive.
+        # Empty `data: {... delta:{} ...}` chunks (standard OpenAI format,
+        # not SSE comment lines — Open WebUI's frontend parser drops those).
         while not agent_task.done():
             try:
                 await asyncio.wait_for(asyncio.shield(agent_task), timeout=5.0)

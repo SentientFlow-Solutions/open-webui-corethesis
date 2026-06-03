@@ -3,7 +3,13 @@
 # use build args in the docker build command with --build-arg="BUILDARG=true"
 ARG USE_CUDA=false
 ARG USE_OLLAMA=false
-ARG USE_SLIM=false
+# CoreThesis: default USE_SLIM=true so the build skips baking in the
+# sentence-transformers RAG embedding model, faster-whisper, tiktoken,
+# and nltk corpora at image-build time. Combined with OFFLINE_MODE=True
+# at runtime, RAG/whisper features are off (we don't use them) and the
+# image is ~3-4 GB smaller. Override with --build-arg USE_SLIM=false
+# in Coolify if you ever need RAG back.
+ARG USE_SLIM=true
 ARG USE_PERMISSION_HARDENING=false
 # Tested with cu117 for CUDA 11 and cu121 for CUDA 12 (default)
 ARG USE_CUDA_VER=cu128
@@ -124,13 +130,16 @@ RUN echo -n 00000000-0000-0000-0000-000000000000 > $HOME/.cache/chroma/telemetry
 # Make sure the user has access to the app and root directory
 RUN chown -R $UID:$GID /app $HOME
 
-# Install common system dependencies
+# Install common system dependencies.
+# CoreThesis: trimmed from upstream — we don't use document conversion
+# (pandoc), audio/video transcription (ffmpeg, libsm6, libxext6), or
+# MariaDB (libmariadb-dev). Dropping these ~286→~50 apt packages cuts
+# the build's apt-install layer from ~1.1 GB to ~150 MB, fitting in
+# the Coolify build host's available disk.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    git build-essential pandoc gcc netcat-openbsd curl jq \
-    libmariadb-dev \
-    python3-dev \
-    ffmpeg libsm6 libxext6 zstd \
+    git build-essential gcc python3-dev \
+    netcat-openbsd curl jq zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # install python dependencies

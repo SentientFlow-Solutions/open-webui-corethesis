@@ -107,6 +107,7 @@ from open_webui.routers import (
     automations,
     calendar,
     openclaw,
+    langfuse,
 )
 
 from open_webui.routers.retrieval import (
@@ -526,6 +527,7 @@ from open_webui.env import (
     RESET_CONFIG_ON_START,
     ENABLE_VERSION_UPDATE_CHECK,
     ENABLE_OTEL,
+    ENABLE_LANGFUSE,
     EXTERNAL_PWA_MANIFEST_URL,
     AIOHTTP_CLIENT_SESSION_SSL,
     ENABLE_STAR_SESSIONS_MIDDLEWARE,
@@ -1458,6 +1460,7 @@ app.include_router(terminals.router, prefix='/api/v1/terminals', tags=['terminal
 app.include_router(automations.router, prefix='/api/v1/automations', tags=['automations'])
 app.include_router(calendar.router, prefix='/api/v1/calendars', tags=['calendars'])
 app.include_router(openclaw.router, prefix='/api/v1/openclaw', tags=['openclaw'])
+app.include_router(langfuse.router, prefix='/api/v1/langfuse', tags=['langfuse'])
 
 # SCIM 2.0 API for identity management
 if ENABLE_SCIM:
@@ -2394,6 +2397,7 @@ async def get_app_config(request: Request):
                     'enable_google_drive_integration': app.state.config.ENABLE_GOOGLE_DRIVE_INTEGRATION,
                     'enable_onedrive_integration': app.state.config.ENABLE_ONEDRIVE_INTEGRATION,
                     'enable_memories': app.state.config.ENABLE_MEMORIES,
+                    'enable_langfuse': ENABLE_LANGFUSE,
                     **(
                         {
                             'enable_onedrive_personal': ENABLE_ONEDRIVE_PERSONAL,

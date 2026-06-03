@@ -1176,6 +1176,17 @@ async def generate_chat_completion(
     if 'max_tokens' in payload and 'max_completion_tokens' in payload:
         del payload['max_tokens']
 
+    # Langfuse-friendly: when streaming, ask the upstream OpenAI-compatible
+    # provider to include a final usage chunk. Without this, the SSE stream
+    # ends without token counts → Open WebUI's assistant_message.usage stays
+    # empty → langfuse trace would be missing cost/latency data.
+    if payload.get('stream'):
+        stream_options = payload.get('stream_options') or {}
+        if not isinstance(stream_options, dict):
+            stream_options = {}
+        stream_options.setdefault('include_usage', True)
+        payload['stream_options'] = stream_options
+
     # Convert the modified body back to JSON
     if 'logit_bias' in payload and payload['logit_bias']:
         logit_bias = convert_logit_bias_input_to_json(payload['logit_bias'])

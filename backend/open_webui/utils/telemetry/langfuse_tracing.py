@@ -156,13 +156,33 @@ def _emit(payload: dict) -> None:
 
 
 async def trace_chat_turn(ctx: dict) -> None:
-    """Fire-and-forget: emit a Langfuse trace for this chat turn. Never raises."""
+    """Fire-and-forget: emit a Langfuse trace for this chat turn. Never raises.
+
+    Emits the trace even when usage_details is missing — some providers (and
+    some streaming responses without `stream_options.include_usage=true`) don't
+    return token counts in the response payload. We'd rather have a trace
+    without cost numbers than no trace at all; the cost data can be back-filled
+    by Langfuse from the model name + input/output via its model registry.
+    """
     if not ENABLE_LANGFUSE:
+        log.info("langfuse trace skipped: ENABLE_LANGFUSE=false")
         return
     try:
         payload = build_generation_payload(ctx)
-        if payload is None or not payload.get("usage_details"):
+        if payload is None:
+            metadata = ctx.get("metadata") or {}
+            log.info(
+                "langfuse trace skipped: not traceable chat_id=%r",
+                metadata.get("chat_id"),
+            )
             return
+        if not payload.get("usage_details"):
+            log.info(
+                "langfuse trace EMITTED without usage_details — provider didn't "
+                "return token counts (model=%r chat=%r)",
+                payload.get("model"),
+                payload.get("session_id"),
+            )
         asyncio.get_running_loop().run_in_executor(None, _emit, payload)
     except Exception as e:  # pragma: no cover - defensive
-        log.debug(f"trace_chat_turn skipped (ignored): {e}")
+        log.warning(f"trace_chat_turn skipped (ignored): {e}")

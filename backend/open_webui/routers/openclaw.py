@@ -1,38 +1,52 @@
 """
-OpenClaw module — bridges the locally-running OpenClaw gateway into Open WebUI
-as a first-class sidebar module.
+OpenClaw module — bridges the locally-running OpenClaw gateway into Open WebUI.
 
 The gateway is WebSocket-native; we invoke it through the `openclaw agent --json`
 CLI which the gateway service exposes for one-shot agent turns. This keeps the
 integration simple (no WS framing) and gives us clear exit codes + stderr.
 
-Endpoints (mounted at /api/v1/openclaw):
-  GET  /health     liveness + reachability of the OpenClaw binary
-  GET  /agents     list configured agents (id, name, emoji, model)
-  POST /chat       one-shot turn against an agent; returns {reply, session_key}
+Two surfaces:
+
+1. **Native module** (mounted at /api/v1/openclaw):
+     GET  /health    liveness + reachability of the OpenClaw binary
+     GET  /agents    list configured agents (id, name, emoji, model)
+     POST /chat      one-shot turn; returns {reply, session_key} JSON
+
+2. **OpenAI-compatible adapter** (mounted at /api/v1/openclaw/v1):
+     GET  /v1/models                  one model row: "openclaw"
+     POST /v1/chat/completions        OpenAI-format chat with SSE streaming
+   Wire this into Open WebUI's Admin → Settings → Connections (OpenAI API tab)
+   so OpenClaw appears in the model dropdown and uses Open WebUI's main chat
+   UI — markdown, slash menu, file drops, history, branching, all of it.
 
 Config (env, set on the Open WebUI container):
   OPENCLAW_BIN              path to the openclaw CLI (default: "openclaw")
-  OPENCLAW_DEFAULT_AGENT    agent id used when client omits it (default: "main")
+  OPENCLAW_DEFAULT_AGENT    agent id used internally (default: "main")
   OPENCLAW_TIMEOUT_SECONDS  per-call timeout (default: 600)
   OPENCLAW_DEFAULT_THINKING optional default thinking level passed to --thinking
+  OPENCLAW_MODEL_ID         model id exposed to Open WebUI (default: "openclaw")
 
-Session continuity: the gateway holds context per --session-key. We namespace
-keys by Open WebUI user id so multi-tenant chats don't bleed:
-    openclaw:webui-<user_id>-<chat_id>
-The frontend creates a fresh <chat_id> per conversation and keeps using it.
+Session continuity / multi-tenant isolation: the gateway holds context per
+--session-key. Every request derives the key from the authenticated Open WebUI
+user.id and a per-conversation chat_id, so distinct users never share gateway
+state — and a single user's distinct chats are isolated from each other too.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import shlex
+import time
+import uuid
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from open_webui.utils.auth import get_verified_user
@@ -60,6 +74,40 @@ def _timeout_seconds() -> int:
 def _default_thinking() -> Optional[str]:
     val = os.environ.get("OPENCLAW_DEFAULT_THINKING")
     return val if val else None
+
+
+def _model_id() -> str:
+    """The id Open WebUI sees in its model dropdown. Single model, no agents
+    exposed — `OPENCLAW_DEFAULT_AGENT` is the real agent under the hood."""
+    return os.environ.get("OPENCLAW_MODEL_ID", "openclaw").strip() or "openclaw"
+
+
+def _safe_id(raw: str, fallback: str = "x") -> str:
+    """Sanitize a string for use as a session-key fragment."""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", raw or "")[:64]
+    return cleaned or fallback
+
+
+def _derive_chat_id(
+    explicit_chat_id: Optional[str],
+    messages: list[dict[str, Any]],
+) -> str:
+    """Find a stable per-conversation identifier.
+
+    Priority: explicit chat_id header from Open WebUI → hash of the first user
+    message (stable for the lifetime of that conversation) → 'new'.
+    """
+    if explicit_chat_id:
+        return _safe_id(explicit_chat_id, "new")
+    if messages:
+        first_user = next(
+            (m for m in messages if isinstance(m, dict) and m.get("role") == "user"),
+            None,
+        )
+        if first_user:
+            seed = json.dumps(first_user.get("content"), sort_keys=True, default=str)
+            return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+    return "new"
 
 
 async def _run_openclaw(argv: list[str], timeout: int) -> tuple[int, str, str]:
@@ -325,3 +373,260 @@ async def chat(
         )
 
     return ChatResponse(reply=reply, agent=agent, session_key=session_key, raw=raw)
+
+
+# -----------------------------------------------------------------------------
+# OpenAI-compatible adapter (so Open WebUI's main chat UI can use OpenClaw)
+# -----------------------------------------------------------------------------
+#
+# Wire-up in Open WebUI: Admin → Settings → Connections → OpenAI API → Add.
+#   URL:     http://172.17.0.1:18181/api/v1/openclaw/v1
+#   API Key: anything non-empty (we don't validate; the endpoint is loopback-
+#            bound and only reachable from the Open WebUI proxy)
+#   Enable "Forward User Info" so headers X-OpenWebUI-User-* + X-OpenWebUI-Chat-
+#   Id reach us — they're how we keep multi-tenant + per-conversation isolation.
+
+
+def _messages_to_message(messages: list[dict[str, Any]]) -> str:
+    """Take the latest user message text out of an OpenAI-format messages list.
+
+    OpenClaw maintains conversation history server-side per session-key, so we
+    only need to forward the newest user turn (not the full history). The
+    gateway will append it to whatever it already has for this session.
+
+    `content` can be a string or a list of content parts (text/image/file). We
+    inline the text parts; image/file passthrough is a separate task (P4).
+    """
+    user_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
+    if not user_msgs:
+        return ""
+    last = user_msgs[-1].get("content")
+    if isinstance(last, str):
+        return last
+    if isinstance(last, list):
+        parts: list[str] = []
+        for part in last:
+            if isinstance(part, dict):
+                t = part.get("text") or part.get("content")
+                if isinstance(t, str):
+                    parts.append(t)
+        return "\n".join(parts)
+    return str(last or "")
+
+
+def _sse_chunk(chunk_id: str, created: int, model: str, content: str, finish: Optional[str] = None) -> str:
+    delta: dict[str, Any] = {}
+    if content:
+        delta["content"] = content
+    payload = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish,
+            }
+        ],
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _slice_for_streaming(text: str, n: int = 24) -> list[str]:
+    """Chop text into reasonably-sized chunks so the client renders progressively.
+
+    OpenClaw's CLI is non-streaming today (returns the whole reply at once), so
+    we synthesize a typing-out effect. Each chunk is ~24 chars, broken on word
+    boundaries when possible. Cheap; runs after the agent already finished.
+    """
+    if not text:
+        return []
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        end = min(i + n, len(text))
+        # break on word boundary if we're mid-word and not at the end
+        if end < len(text):
+            space = text.rfind(" ", i, end)
+            if space > i:
+                end = space + 1
+        out.append(text[i:end])
+        i = end
+    return out
+
+
+@router.get("/v1/models")
+async def openai_compat_list_models(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    """OpenAI-compatible models endpoint. Returns a single 'openclaw' row that
+    Open WebUI lists in its model dropdown. The agent picker on /agents is
+    deliberately not exposed here — one model entry, no agent fan-out."""
+    model = _model_id()
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "corethesis",
+            }
+        ],
+    }
+
+
+@router.post("/v1/chat/completions")
+async def openai_compat_chat_completions(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_openwebui_user_id: Optional[str] = Header(default=None),
+    x_openwebui_chat_id: Optional[str] = Header(default=None),
+):
+    """OpenAI-compatible chat completions. Streams SSE when stream=true (default
+    in Open WebUI), non-streaming JSON otherwise.
+
+    Multi-user isolation: session key derived from X-OpenWebUI-User-Id +
+    X-OpenWebUI-Chat-Id headers (Open WebUI sets these when "Forward User Info"
+    is enabled on the connection). If headers aren't present, we fall back to a
+    hash of the first user message to keep one conversation stable while still
+    isolating different conversations from each other.
+    """
+    try:
+        body = await request.json()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"invalid json body: {e}")
+
+    messages = body.get("messages") if isinstance(body, dict) else None
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(status_code=400, detail="messages[] is required")
+
+    user_message = _messages_to_message(messages).strip()
+    if not user_message:
+        raise HTTPException(status_code=400, detail="latest user message is empty")
+
+    stream = bool(body.get("stream", True))
+    requested_model = str(body.get("model") or _model_id())
+
+    user_id = _safe_id(x_openwebui_user_id or "anon", "anon")
+    chat_id = _derive_chat_id(x_openwebui_chat_id, messages)
+
+    agent = _default_agent()
+    session_key = f"agent:{agent}:webui-{user_id}-{chat_id}"
+    thinking = _default_thinking()
+    timeout = _timeout_seconds()
+    binary = _bin()
+
+    argv = [
+        binary, "agent",
+        "--agent", agent,
+        "--session-key", session_key,
+        "--message", user_message,
+        "--json",
+        "--timeout", str(timeout),
+    ]
+    if thinking:
+        argv.extend(["--thinking", thinking])
+
+    log.info(
+        "openclaw v1/chat user=%s chat=%s session=%s stream=%s",
+        user_id, chat_id, session_key, stream,
+    )
+
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+
+    if not stream:
+        # Non-streaming branch: just run, wait, return one JSON.
+        rc, out, err = await _run_openclaw(argv, timeout=timeout + 30)
+        if rc != 0:
+            detail = err.strip() or out.strip() or f"openclaw agent exited with {rc}"
+            log.warning("openclaw v1/chat agent failed (rc=%d): %s", rc, detail[:500])
+            reply = f"⚠️ OpenClaw gateway error:\n\n```\n{detail.strip()}\n```"
+        else:
+            reply, _raw = _extract_reply(out)
+            if not reply:
+                reply = "⚠️ OpenClaw returned an empty reply."
+        return {
+            "id": chunk_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": requested_model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": reply},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+
+    # Streaming branch: run openclaw as a background task, emit SSE keepalive
+    # comments every few seconds while it thinks (the agent is slow today —
+    # ~60-120s cold-start). When the task completes, emit the real chunks.
+    # Without the keepalives, the browser sees dead air and assumes the
+    # connection died (it'd take ~30s before Open WebUI gives up).
+
+    async def stream_body():
+        # Initial role-only chunk so the client renders the empty assistant
+        # bubble + typing indicator immediately.
+        yield _sse_chunk(chunk_id, created, requested_model, "")
+
+        # Kick off the agent.
+        agent_task = asyncio.create_task(_run_openclaw(argv, timeout=timeout + 30))
+
+        # Heartbeat until the agent finishes.
+        while not agent_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(agent_task), timeout=5.0)
+            except asyncio.TimeoutError:
+                # SSE comment line: starts with ':' — keeps the connection
+                # alive without contributing visible content. Standard pattern
+                # for long-running OpenAI-compatible endpoints.
+                yield ": keepalive\n\n"
+            except Exception:
+                # Real failure — break out and let the post-loop block handle.
+                break
+
+        # Collect the result (or surface the exception as an in-chat error).
+        try:
+            rc, out, err = agent_task.result()
+        except Exception as e:  # noqa: BLE001
+            log.warning("openclaw v1/chat task raised: %s", e)
+            reply = f"⚠️ OpenClaw gateway error:\n\n```\n{e}\n```"
+            for piece in _slice_for_streaming(reply):
+                yield _sse_chunk(chunk_id, created, requested_model, piece)
+                await asyncio.sleep(0.01)
+            yield _sse_chunk(chunk_id, created, requested_model, "", finish="stop")
+            yield "data: [DONE]\n\n"
+            return
+
+        if rc != 0:
+            detail = err.strip() or out.strip() or f"openclaw agent exited with {rc}"
+            log.warning("openclaw v1/chat agent failed (rc=%d): %s", rc, detail[:500])
+            reply = f"⚠️ OpenClaw gateway error:\n\n```\n{detail.strip()}\n```"
+        else:
+            reply, _raw = _extract_reply(out)
+            if not reply:
+                reply = "⚠️ OpenClaw returned an empty reply."
+
+        for piece in _slice_for_streaming(reply):
+            yield _sse_chunk(chunk_id, created, requested_model, piece)
+            await asyncio.sleep(0.01)
+        yield _sse_chunk(chunk_id, created, requested_model, "", finish="stop")
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        stream_body(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            # Tell nginx/Traefik not to buffer SSE — heartbeats must flow.
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )

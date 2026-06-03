@@ -151,7 +151,7 @@
 			automations: { label: 'Automations', href: '/automations', iconType: 'automations' },
 			calendar: { label: 'Calendar', href: '/calendar', iconType: 'calendar' },
 			playground: { label: 'Playground', href: '/playground', iconType: 'playground' },
-			openclaw: { label: 'OpenClaw', href: '/openclaw', iconType: 'openclaw' }
+			openclaw: { label: 'OpenClaw', href: '/?models=openclaw', iconType: 'openclaw' }
 		};
 		return items[id];
 	};

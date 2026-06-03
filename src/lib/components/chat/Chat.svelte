@@ -98,6 +98,7 @@
 
 	import Banner from '../common/Banner.svelte';
 	import MessageInput from '$lib/components/chat/MessageInput.svelte';
+	import LangfuseUsageBar from '$lib/components/chat/LangfuseUsageBar.svelte';
 	import Messages from '$lib/components/chat/Messages.svelte';
 	import Navbar from '$lib/components/chat/Navbar.svelte';
 	import ChatControls from './ChatControls.svelte';
@@ -3093,6 +3094,7 @@
 							</div>
 
 							<div class=" pb-2 {dragged ? 'z-0' : 'z-10'}">
+								<LangfuseUsageBar chatId={$chatId} {history} temporary={$temporaryChatEnabled} />
 								<MessageInput
 									bind:this={messageInput}
 									{history}

@@ -33,9 +33,12 @@ ARG GID=0
 FROM --platform=$BUILDPLATFORM node:22-alpine3.20 AS build
 ARG BUILD_HASH
 
-# CoreThesis: raise Node heap limit during Vite build. 4096 is upstream's suggestion;
-# on a 4GB host we cap lower so the build doesn't fight the rest of the system.
-ENV NODE_OPTIONS="--max-old-space-size=3072"
+# CoreThesis: raise Node heap limit during Vite build. Upstream suggests
+# 4096; the Coolify build hit OOM at 3017 MB with 3072 and at ~3500 MB
+# with 4096 in past attempts. 5120 matches what reliably works locally
+# on a Mac build. The Coolify build host has ~12 GB free RAM + 4 GB swap,
+# so this fits comfortably inside the build container.
+ENV NODE_OPTIONS="--max-old-space-size=5120"
 
 WORKDIR /app
 

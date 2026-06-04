@@ -50,12 +50,26 @@ def build_generation_payload(ctx: dict) -> Optional[dict]:
     assistant_message = ctx.get("assistant_message") or {}
     usage = assistant_message.get("usage") or {}
     usage_details = {}
-    if usage.get("input_tokens") is not None:
-        usage_details["input"] = int(usage["input_tokens"])
-    if usage.get("output_tokens") is not None:
-        usage_details["output"] = int(usage["output_tokens"])
-    if usage.get("total_tokens") is not None:
-        usage_details["total"] = int(usage["total_tokens"])
+    # Accept both naming conventions:
+    # - OpenAI / Chat Completions API: prompt_tokens / completion_tokens
+    # - Anthropic / Responses API: input_tokens / output_tokens
+    # Open WebUI's middleware forwards the upstream provider's shape verbatim,
+    # so we have to read both. Without this, every OpenAI / DeepInfra /
+    # OpenRouter trace lands in Langfuse with 0 tokens and $0 cost.
+    input_tokens = usage.get("input_tokens")
+    if input_tokens is None:
+        input_tokens = usage.get("prompt_tokens")
+    output_tokens = usage.get("output_tokens")
+    if output_tokens is None:
+        output_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+
+    if input_tokens is not None:
+        usage_details["input"] = int(input_tokens)
+    if output_tokens is not None:
+        usage_details["output"] = int(output_tokens)
+    if total_tokens is not None:
+        usage_details["total"] = int(total_tokens)
 
     model = (
         metadata.get("model")

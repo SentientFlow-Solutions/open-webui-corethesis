@@ -414,6 +414,51 @@ def _messages_to_message(messages: list[dict[str, Any]]) -> str:
     return str(last or "")
 
 
+_tiktoken_enc = None
+
+
+def _count_tokens(text: str) -> int:
+    """Count tokens with cl100k_base (GPT-4 / Qwen / DeepSeek approximate).
+
+    Used to populate the usage chunk we ship with OpenAI-compat streaming
+    responses. OpenClaw's CLI is non-streaming and doesn't return a token
+    breakdown, so we approximate. cl100k_base over-counts modestly for
+    non-OpenAI tokenizers but is close enough for cost-tracking / display.
+    Returns 0 on any failure (never raises — usage tracking must not break
+    a chat reply).
+    """
+    if not text:
+        return 0
+    global _tiktoken_enc
+    if _tiktoken_enc is None:
+        try:
+            import tiktoken
+            _tiktoken_enc = tiktoken.get_encoding(
+                os.environ.get("TIKTOKEN_ENCODING_NAME", "cl100k_base")
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("tiktoken unavailable, token counts will be 0: %s", e)
+            _tiktoken_enc = False
+    if not _tiktoken_enc:
+        return 0
+    try:
+        return len(_tiktoken_enc.encode(text))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _build_usage(messages_in: list[dict[str, Any]], reply: str) -> dict[str, int]:
+    """Compute OpenAI-shape usage dict from the input messages and reply."""
+    input_text = "\n".join(
+        (m.get("content") if isinstance(m.get("content"), str) else "")
+        or ""
+        for m in (messages_in or [])
+    )
+    pt = _count_tokens(input_text)
+    ct = _count_tokens(reply)
+    return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+
+
 def _sse_chunk(
     chunk_id: str,
     created: int,
@@ -439,6 +484,22 @@ def _sse_chunk(
                 "finish_reason": finish,
             }
         ],
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _sse_usage_chunk(chunk_id: str, created: int, model: str, usage: dict[str, int]) -> str:
+    """Final OpenAI-style usage chunk — emitted when stream_options.include_usage
+    is requested (or always, for forward-compat). Open WebUI's middleware reads
+    this and populates assistant_message.usage, which feeds Langfuse trace
+    tokens and the My Usage dashboard."""
+    payload = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": usage,
     }
     return f"data: {json.dumps(payload)}\n\n"
 
@@ -571,7 +632,7 @@ async def openai_compat_chat_completions(
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": _build_usage(messages, reply),
         }
 
     # Streaming branch: run openclaw as a background task, emit SSE keepalive
@@ -618,6 +679,7 @@ async def openai_compat_chat_completions(
                 yield _sse_chunk(chunk_id, created, requested_model, piece)
                 await asyncio.sleep(0.01)
             yield _sse_chunk(chunk_id, created, requested_model, "", finish="stop")
+            yield _sse_usage_chunk(chunk_id, created, requested_model, _build_usage(messages, reply))
             yield "data: [DONE]\n\n"
             return
 
@@ -634,6 +696,7 @@ async def openai_compat_chat_completions(
             yield _sse_chunk(chunk_id, created, requested_model, piece)
             await asyncio.sleep(0.01)
         yield _sse_chunk(chunk_id, created, requested_model, "", finish="stop")
+        yield _sse_usage_chunk(chunk_id, created, requested_model, _build_usage(messages, reply))
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

@@ -1530,13 +1530,20 @@
 	};
 
 	const chatCompletedHandler = async (_chatId, modelId, responseMessageId, messages) => {
+		// IMPORTANT: clear taskIds BEFORE the sidebar refresh await below.
+		// `taskIds` gates the loading/stop button in MessageInput (see its
+		// `isActive` derived store). If we leave this at the end, slow models
+		// like OpenClaw block here for tens of seconds while the chat-list
+		// query queues behind in-flight background tasks (title gen,
+		// follow-ups), and the user sees a stuck spinner long after the
+		// reply already rendered.
+		taskIds = null;
 		// Backend handles outlet filters and persistence inline.
 		// Just refresh the sidebar chat list.
 		if ($chatId == _chatId && !$temporaryChatEnabled) {
 			currentChatPage.set(1);
 			await chats.set(await getChatList(localStorage.token, $currentChatPage));
 		}
-		taskIds = null;
 	};
 
 	const chatActionHandler = async (_chatId, actionId, modelId, responseMessageId, event = null) => {

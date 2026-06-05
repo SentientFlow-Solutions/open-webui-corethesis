@@ -3941,6 +3941,15 @@ async def streaming_chat_response_handler(response, ctx):
 
                                 if 'selected_model_id' in data:
                                     model_id = data['selected_model_id']
+                                    # Stash on metadata so trace_chat_turn /
+                                    # langfuse get the real underlying model
+                                    # the provider routed to (e.g. an OpenClaw
+                                    # chat resolves to a specific DeepInfra
+                                    # model id at runtime). Without this the
+                                    # trace would be tagged with the alias the
+                                    # user clicked in the picker and Langfuse
+                                    # couldn't price it.
+                                    metadata['selected_model_id'] = model_id
                                     await Chats.upsert_message_to_chat_by_id_and_message_id(
                                         metadata['chat_id'],
                                         metadata['message_id'],

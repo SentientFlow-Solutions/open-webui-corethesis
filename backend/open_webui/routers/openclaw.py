@@ -150,6 +150,36 @@ def _clean_reply(text: str) -> str:
     return cleaned
 
 
+def _extract_underlying_model(envelope: Optional[dict[str, Any]]) -> Optional[str]:
+    """Pull the actual provider/model used to generate the reply.
+
+    openclaw 2026.5.x emits this under ``result.meta.executionTrace`` with
+    ``winnerProvider`` + ``winnerModel`` fields (e.g. provider="deepinfra",
+    model="Qwen/Qwen3-Next-80B-A3B-Instruct"). We expose the combined string
+    ("deepinfra/Qwen/Qwen3-Next-80B-A3B-Instruct") so Langfuse can match it
+    against its model-pricing catalog and so the user sees the real model
+    on the trace instead of the opaque "openclaw" alias.
+    """
+    if not isinstance(envelope, dict):
+        return None
+    result = envelope.get("result")
+    if not isinstance(result, dict):
+        return None
+    meta = result.get("meta")
+    if not isinstance(meta, dict):
+        return None
+    et = meta.get("executionTrace")
+    if not isinstance(et, dict):
+        return None
+    provider = et.get("winnerProvider")
+    model = et.get("winnerModel")
+    if isinstance(model, str) and model:
+        if isinstance(provider, str) and provider and not model.startswith(provider + "/"):
+            return f"{provider}/{model}"
+        return model
+    return None
+
+
 def _extract_reply(stdout: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Pull the assistant reply text from `openclaw agent --json` stdout.
 
@@ -488,6 +518,14 @@ def _sse_chunk(
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _sse_model_chunk(model_id: str) -> str:
+    """Special SSE payload Open WebUI's middleware recognises (line ~3942 of
+    middleware.py). When present it updates the chat record's selectedModelId
+    so the UI tags the message with the real underlying model — and our
+    Langfuse hook reads the same field to populate the trace's model."""
+    return f"data: {json.dumps({'selected_model_id': model_id})}\n\n"
+
+
 def _sse_usage_chunk(chunk_id: str, created: int, model: str, usage: dict[str, int]) -> str:
     """Final OpenAI-style usage chunk — emitted when stream_options.include_usage
     is requested (or always, for forward-compat). Open WebUI's middleware reads
@@ -612,19 +650,23 @@ async def openai_compat_chat_completions(
     if not stream:
         # Non-streaming branch: just run, wait, return one JSON.
         rc, out, err = await _run_openclaw(argv, timeout=timeout + 30)
+        underlying_model: Optional[str] = None
         if rc != 0:
             detail = err.strip() or out.strip() or f"openclaw agent exited with {rc}"
             log.warning("openclaw v1/chat agent failed (rc=%d): %s", rc, detail[:500])
             reply = f"⚠️ OpenClaw gateway error:\n\n```\n{detail.strip()}\n```"
         else:
-            reply, _raw = _extract_reply(out)
+            reply, raw = _extract_reply(out)
             if not reply:
                 reply = "⚠️ OpenClaw returned an empty reply."
+            underlying_model = _extract_underlying_model(raw)
         return {
             "id": chunk_id,
             "object": "chat.completion",
             "created": created,
-            "model": requested_model,
+            # Report the actual provider/model the gateway routed to so
+            # Langfuse can price it. Falls back to the alias if unknown.
+            "model": underlying_model or requested_model,
             "choices": [
                 {
                     "index": 0,
@@ -683,20 +725,28 @@ async def openai_compat_chat_completions(
             yield "data: [DONE]\n\n"
             return
 
+        underlying_model: Optional[str] = None
         if rc != 0:
             detail = err.strip() or out.strip() or f"openclaw agent exited with {rc}"
             log.warning("openclaw v1/chat agent failed (rc=%d): %s", rc, detail[:500])
             reply = f"⚠️ OpenClaw gateway error:\n\n```\n{detail.strip()}\n```"
         else:
-            reply, _raw = _extract_reply(out)
+            reply, raw = _extract_reply(out)
             if not reply:
                 reply = "⚠️ OpenClaw returned an empty reply."
+            underlying_model = _extract_underlying_model(raw)
 
+        # Tag the chat with the real provider/model BEFORE the content chunks so
+        # the UI badge + Langfuse trace see it from the start.
+        if underlying_model:
+            yield _sse_model_chunk(underlying_model)
+
+        emitted_model = underlying_model or requested_model
         for piece in _slice_for_streaming(reply):
-            yield _sse_chunk(chunk_id, created, requested_model, piece)
+            yield _sse_chunk(chunk_id, created, emitted_model, piece)
             await asyncio.sleep(0.01)
-        yield _sse_chunk(chunk_id, created, requested_model, "", finish="stop")
-        yield _sse_usage_chunk(chunk_id, created, requested_model, _build_usage(messages, reply))
+        yield _sse_chunk(chunk_id, created, emitted_model, "", finish="stop")
+        yield _sse_usage_chunk(chunk_id, created, emitted_model, _build_usage(messages, reply))
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

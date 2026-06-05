@@ -71,8 +71,14 @@ def build_generation_payload(ctx: dict) -> Optional[dict]:
     if total_tokens is not None:
         usage_details["total"] = int(total_tokens)
 
+    # Prefer `selected_model_id` — providers that route to a different
+    # underlying model at request time (e.g. OpenClaw resolving to a specific
+    # DeepInfra model, Arena random-pick) emit this via streaming so Langfuse
+    # can match the real model against its pricing catalog. Falls back to the
+    # alias the user originally picked.
     model = (
-        metadata.get("model")
+        metadata.get("selected_model_id")
+        or metadata.get("model")
         or (ctx.get("model") or {}).get("id")
         or (ctx.get("form_data") or {}).get("model")
     )

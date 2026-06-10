@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { getContext } from 'svelte';
+	import { getContext, onMount, onDestroy } from 'svelte';
 	import { config } from '$lib/stores';
 	import { getChatUsage, type ChatUsage } from '$lib/apis/langfuse';
 
@@ -46,9 +46,32 @@
 		usage = null;
 		refresh();
 	}
-	$: if (enabled && localTurns) {
+	let lastTurns = 0;
+	$: if (enabled && localTurns !== lastTurns) {
+		lastTurns = localTurns;
 		setTimeout(refresh, 4000);
 	}
+
+	// Poll every 10s so Langfuse-processed traces/costs appear without any
+	// manual action. Skipped while the tab is hidden; the backend's ~20s
+	// response cache keeps this cheap on the Langfuse side.
+	const POLL_INTERVAL_MS = 10_000;
+	let pollId: ReturnType<typeof setInterval> | null = null;
+
+	onMount(() => {
+		pollId = setInterval(() => {
+			if (enabled && document.visibilityState === 'visible') {
+				refresh();
+			}
+		}, POLL_INTERVAL_MS);
+	});
+
+	onDestroy(() => {
+		if (pollId) {
+			clearInterval(pollId);
+			pollId = null;
+		}
+	});
 
 	$: shownTokens = localTokens;
 	$: shownTurns = usage?.turns ?? localTurns;

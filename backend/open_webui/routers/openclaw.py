@@ -496,12 +496,15 @@ def _sse_chunk(
     content: str,
     finish: Optional[str] = None,
     role: Optional[str] = None,
+    reasoning: Optional[str] = None,
 ) -> str:
     delta: dict[str, Any] = {}
     if role:
         delta["role"] = role
     if content:
         delta["content"] = content
+    if reasoning:
+        delta["reasoning_content"] = reasoning
     payload = {
         "id": chunk_id,
         "object": "chat.completion.chunk",
@@ -540,6 +543,25 @@ def _sse_usage_chunk(chunk_id: str, created: int, model: str, usage: dict[str, i
         "usage": usage,
     }
     return f"data: {json.dumps(payload)}\n\n"
+
+
+def _narration_line(tick: int, elapsed: float) -> Optional[str]:
+    """What the Thinking block should say at a given keepalive tick (5s cadence).
+
+    Emitted as `reasoning_content` deltas, which Open WebUI's middleware turns
+    into its native collapsible "Thinking…" block — the same UI real reasoning
+    models get. tick 0 fires immediately, tick 1 after ~5s, then an
+    elapsed-time update every 3rd tick (~15s) so a two-minute agent wait reads
+    as a short activity log instead of 24 lines of noise. Returns None for
+    silent ticks (the caller still sends an empty keepalive chunk).
+    """
+    if tick == 0:
+        return "Connecting to OpenClaw agent…\n"
+    if tick == 1:
+        return "Agent is working on your request…\n"
+    if tick % 3 == 0:
+        return f"Still working — {int(elapsed)}s elapsed…\n"
+    return None
 
 
 def _slice_for_streaming(text: str, n: int = 24) -> list[str]:
@@ -699,14 +721,31 @@ async def openai_compat_chat_completions(
         # Kick off the agent.
         agent_task = asyncio.create_task(_run_openclaw(argv, timeout=timeout + 30))
 
-        # Heartbeat until the agent finishes.
-        # Empty `data: {... delta:{} ...}` chunks (standard OpenAI format,
-        # not SSE comment lines — Open WebUI's frontend parser drops those).
+        # Heartbeat until the agent finishes, narrating progress via
+        # `reasoning_content` deltas — Open WebUI's middleware renders these as
+        # its native collapsible "Thinking…" block and closes it (with the real
+        # duration) when the first content chunk lands. Silent ticks still emit
+        # an empty `delta: {}` chunk (standard OpenAI format, not SSE comment
+        # lines — Open WebUI's frontend parser drops those) so the ~5s
+        # keepalive cadence is preserved.
+        wait_started = time.time()
+        yield _sse_chunk(
+            chunk_id, created, requested_model, "", reasoning=_narration_line(0, 0.0)
+        )
+
+        tick = 0
         while not agent_task.done():
             try:
                 await asyncio.wait_for(asyncio.shield(agent_task), timeout=5.0)
             except asyncio.TimeoutError:
-                yield _sse_chunk(chunk_id, created, requested_model, "")
+                tick += 1
+                yield _sse_chunk(
+                    chunk_id,
+                    created,
+                    requested_model,
+                    "",
+                    reasoning=_narration_line(tick, time.time() - wait_started),
+                )
             except Exception:
                 # Real failure — break out and let the post-loop block handle.
                 break

@@ -41,7 +41,6 @@
 
 	import Name from './Name.svelte';
 	import ProfileImage from './ProfileImage.svelte';
-	import Skeleton from './Skeleton.svelte';
 	import Image from '$lib/components/common/Image.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import RateComment from './RateComment.svelte';
@@ -827,7 +826,8 @@
 							id="response-content-container"
 						>
 							{#if message.content === '' && !message.done && !message.error && !hasVisibleStatus}
-								<Skeleton />
+								<!-- Claude-style wait state: shimmering "Thinking…" instead of the bare pulsing dot -->
+								<div class="shimmer text-base w-fit my-1">{$i18n.t('Thinking...')}</div>
 							{:else if message.content && message.error !== true}
 								<!-- always show message contents even if there's an error -->
 								<!-- unless message.error === true which is legacy error handling, where the error message is stored in message.content -->

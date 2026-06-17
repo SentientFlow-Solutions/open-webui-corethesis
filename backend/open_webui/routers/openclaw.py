@@ -417,31 +417,86 @@ async def chat(
 #   Id reach us — they're how we keep multi-tenant + per-conversation isolation.
 
 
-def _messages_to_message(messages: list[dict[str, Any]]) -> str:
-    """Take the latest user message text out of an OpenAI-format messages list.
+def _content_to_text(content: Any) -> str:
+    """Flatten an OpenAI message `content` (string or list of parts) to text.
 
-    OpenClaw maintains conversation history server-side per session-key, so we
-    only need to forward the newest user turn (not the full history). The
-    gateway will append it to whatever it already has for this session.
-
-    `content` can be a string or a list of content parts (text/image/file). We
-    inline the text parts; image/file passthrough is a separate task (P4).
+    Inlines the text parts; image/file passthrough is a separate task (P4).
     """
-    user_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
-    if not user_msgs:
-        return ""
-    last = user_msgs[-1].get("content")
-    if isinstance(last, str):
-        return last
-    if isinstance(last, list):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
         parts: list[str] = []
-        for part in last:
+        for part in content:
             if isinstance(part, dict):
                 t = part.get("text") or part.get("content")
                 if isinstance(t, str):
                     parts.append(t)
         return "\n".join(parts)
-    return str(last or "")
+    return str(content or "")
+
+
+def _messages_to_message(messages: list[dict[str, Any]]) -> str:
+    """Latest user message text from an OpenAI-format messages list.
+
+    Retained for the endpoint's empty-message guard; the full transcript that is
+    actually sent to the agent is built by `_messages_to_transcript`.
+    """
+    user_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
+    if not user_msgs:
+        return ""
+    return _content_to_text(user_msgs[-1].get("content"))
+
+
+def _messages_to_transcript(messages: list[dict[str, Any]]) -> str:
+    """Render the full conversation into one message string for the agent.
+
+    The OpenClaw CLI accepts only a single `--message` and offers no way to pass
+    a message array; history is otherwise the gateway's per-session memory, which
+    is not reliable across real conversation turns. So we send the whole
+    conversation ourselves each turn (paired with a fresh, ephemeral session key
+    in the caller, so the gateway's own memory can't double-accumulate it).
+
+    System messages are excluded — the OpenClaw agent has its own persona and
+    Open WebUI's default system prompt would conflict with it. For the first
+    turn (no prior history) we send the bare message, identical to the old
+    behaviour, so simple single-shot prompts are unchanged.
+    """
+    turns: list[tuple[str, str]] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = _content_to_text(m.get("content")).strip()
+        if text:
+            turns.append((role, text))
+
+    if not turns:
+        return ""
+
+    last_user_idx = None
+    for i in range(len(turns) - 1, -1, -1):
+        if turns[i][0] == "user":
+            last_user_idx = i
+            break
+    if last_user_idx is None:
+        # No user turn at all — nothing to respond to.
+        return ""
+
+    latest = turns[last_user_idx][1]
+    history = turns[:last_user_idx]
+    if not history:
+        return latest
+
+    lines = ["[Conversation so far — for context]"]
+    for role, text in history:
+        label = "User" if role == "user" else "Assistant"
+        lines.append(f"{label}: {text}")
+    lines.append("")
+    lines.append("[Current message — please respond to this]")
+    lines.append(latest)
+    return "\n".join(lines)
 
 
 _tiktoken_enc = None
@@ -634,9 +689,13 @@ async def openai_compat_chat_completions(
     if not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="messages[] is required")
 
-    user_message = _messages_to_message(messages).strip()
-    if not user_message:
+    # Guard on the latest user turn, but send the FULL conversation transcript
+    # (see _messages_to_transcript): the gateway's per-session memory isn't a
+    # reliable context store across real turns, so Open WebUI is the source of
+    # truth and we forward the whole history every turn.
+    if not _messages_to_message(messages).strip():
         raise HTTPException(status_code=400, detail="latest user message is empty")
+    user_message = _messages_to_transcript(messages).strip()
 
     stream = bool(body.get("stream", True))
     requested_model = str(body.get("model") or _model_id())
@@ -644,8 +703,14 @@ async def openai_compat_chat_completions(
     user_id = _safe_id(x_openwebui_user_id or "anon", "anon")
     chat_id = _derive_chat_id(x_openwebui_chat_id, messages)
 
+    # Ephemeral session key per request. Because we now send the full transcript
+    # ourselves, a stable key would make the gateway re-append the entire history
+    # on every turn (quadratic growth). A fresh key keeps each request a clean,
+    # self-contained turn — and a fresh session adds no cold-start penalty
+    # (measured: new vs reused keys are equally fast). user_id stays in the key
+    # for gateway-side attribution/isolation.
     agent = _default_agent()
-    session_key = f"agent:{agent}:webui-{user_id}-{chat_id}"
+    session_key = f"agent:{agent}:webui-{user_id}-{chat_id}-{uuid.uuid4().hex}"
     thinking = _default_thinking()
     timeout = _timeout_seconds()
     binary = _bin()
